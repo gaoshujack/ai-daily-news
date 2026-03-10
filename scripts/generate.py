@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 AI 行业日报自动生成脚本
-每天由 GitHub Actions 自动触发，搜索最新资讯并生成 HTML 片段
+使用 Tavily 搜索中文资讯，无需 OpenAI 也能生成格式良好的日报
 """
 
 import os
@@ -10,145 +10,137 @@ import datetime
 import requests
 from pathlib import Path
 
-# ── 配置 ──
 SEARCH_API_KEY = os.environ.get("SEARCH_API_KEY", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 TODAY = datetime.date.today().strftime("%Y-%m-%d")
+DATE_CN = datetime.datetime.strptime(TODAY, "%Y-%m-%d").strftime("%Y年%m月%d日")
 NEWS_DIR = Path("news")
 INDEX_FILE = NEWS_DIR / "index.json"
 
+# 中文搜索关键词，按分类
 SEARCH_QUERIES = [
-    "OpenAI GPT latest news today",
-    "Anthropic Claude latest news today",
-    "xAI Grok latest news today",
-    "Google Gemini latest news today",
-    "中国AI大模型 DeepSeek 字节跳动 阿里 最新动态",
+    {"q": f"OpenAI GPT 最新动态 {TODAY}", "section": "OpenAI", "badge": "badge-openai", "card": ""},
+    {"q": f"Anthropic Claude 最新消息 {TODAY}", "section": "Anthropic", "badge": "badge-anthropic", "card": ""},
+    {"q": f"xAI Grok 马斯克 AI {TODAY}", "section": "xAI · Grok", "badge": "badge-xai", "card": "grok"},
+    {"q": f"Google Gemini 最新动态 {TODAY}", "section": "Google Gemini", "badge": "badge-google", "card": ""},
+    {"q": f"DeepSeek 字节跳动 阿里 国内AI大模型 {TODAY}", "section": "国内 AI", "badge": "badge-cn", "card": "cn"},
 ]
 
-# ── 搜索资讯（Tavily API）──
-def search_news(query: str) -> list[dict]:
+WEEKDAYS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+def get_weekday():
+    return WEEKDAYS[datetime.date.today().weekday()]
+
+def search(query: str) -> list:
     if not SEARCH_API_KEY:
         return []
     try:
         resp = requests.post(
             "https://api.tavily.com/search",
-            json={"api_key": SEARCH_API_KEY, "query": query,
-                  "search_depth": "basic", "max_results": 5,
-                  "days": 1},
-            timeout=15
+            json={
+                "api_key": SEARCH_API_KEY,
+                "query": query,
+                "search_depth": "basic",
+                "max_results": 4,
+                "days": 2,
+                "include_answer": False,
+                "include_raw_content": False,
+            },
+            timeout=15,
         )
         resp.raise_for_status()
         return resp.json().get("results", [])
     except Exception as e:
-        print(f"搜索失败 [{query}]: {e}")
+        print(f"  搜索失败 [{query[:30]}]: {e}")
         return []
 
-# ── 调用 OpenAI 生成摘要和 HTML ──
-def generate_html_with_llm(raw_results: list[dict]) -> str:
-    if not OPENAI_API_KEY:
-        return generate_html_fallback(raw_results)
-    
-    context = "\n\n".join(
-        f"标题: {r.get('title','')}\n来源: {r.get('url','')}\n摘要: {r.get('content','')[:300]}"
-        for r in raw_results[:15]
-    )
-    
-    prompt = f"""你是一个AI行业资讯编辑，今天是 {TODAY}。
-以下是今日搜集的原始资讯，请：
-1. 筛选出8-12条最有价值的资讯
-2. 按公司分类：OpenAI、Anthropic、Google Gemini、xAI Grok、国内AI
-3. 为每条资讯生成50-80字中文摘要
-4. 输出严格的 JSON 格式，结构如下：
-{{
-  "sections": [
-    {{
-      "title": "OpenAI 动态",
-      "icon": "🇺🇸",
-      "items": [
-        {{
-          "company": "OpenAI",
-          "badge_class": "badge-openai",
-          "title": "新闻标题",
-          "tags": ["标签1", "标签2"],
-          "summary": "新闻摘要",
-          "highlight": "核心要点（可选）",
-          "url": "原文链接",
-          "time": "时间"
-        }}
-      ]
-    }}
-  ]
-}}
+def clean_title(title: str) -> str:
+    """清理标题，去掉网站名等噪音"""
+    for sep in [" | ", " - ", " – ", " — ", "｜"]:
+        if sep in title:
+            parts = title.split(sep)
+            # 取最长的部分
+            title = max(parts, key=len).strip()
+    return title[:80]
 
-原始资讯：
-{context}
-"""
+def clean_summary(text: str, max_len=150) -> str:
+    """截取摘要"""
+    if not text:
+        return ""
+    text = text.replace("\n", " ").strip()
+    return text[:max_len] + "..." if len(text) > max_len else text
+
+def render_card(item: dict, badge_class: str, card_class: str) -> str:
+    title = clean_title(item.get("title", ""))
+    summary = clean_summary(item.get("content", ""))
+    url = item.get("url", "#")
+    published = item.get("published_date", "")[:10] or "今日"
+
+    if not title or not summary:
+        return ""
+
+    # 从 URL 提取来源域名
     try:
-        resp = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-            json={
-                "model": "gpt-4o-mini",
-                "messages": [{"role": "user", "content": prompt}],
-                "response_format": {"type": "json_object"},
-                "temperature": 0.3
-            },
-            timeout=60
-        )
-        resp.raise_for_status()
-        data = json.loads(resp.json()["choices"][0]["message"]["content"])
-        return render_html(data)
-    except Exception as e:
-        print(f"LLM 生成失败: {e}")
-        return generate_html_fallback(raw_results)
+        from urllib.parse import urlparse
+        source = urlparse(url).netloc.replace("www.", "")
+    except Exception:
+        source = ""
 
-# ── 将结构化数据渲染为 HTML ──
-def render_html(data: dict) -> str:
-    sections_html = ""
-    total = sum(len(s.get("items", [])) for s in data.get("sections", []))
-
-    for section in data.get("sections", []):
-        items_html = ""
-        for item in section.get("items", []):
-            tags_html = "".join(f'<span class="tag">{t}</span>' for t in item.get("tags", []))
-            highlight_html = ""
-            if item.get("highlight"):
-                highlight_html = f'''
-                <div class="highlights">
-                    <h4>核心亮点</h4>
-                    <p>{item["highlight"]}</p>
-                </div>'''
-            items_html += f'''
-            <div class="news-card">
+    return f'''
+            <div class="news-card {card_class}">
                 <div class="news-card-top">
-                    <span class="company-badge {item.get('badge_class','')}">{item.get('company','')}</span>
-                    <span class="news-time">{item.get('time','今日')}</span>
+                    <span class="company-badge {badge_class}">{source}</span>
+                    <span class="news-time">{published}</span>
                 </div>
-                <h2>{item.get('title','')}</h2>
-                <div class="tags">{tags_html}</div>
-                <div class="summary">{item.get('summary','')}</div>
-                {highlight_html}
-                <a href="{item.get('url','#')}" class="source-link" target="_blank">阅读原文 →</a>
+                <h2>{title}</h2>
+                <div class="summary">{summary}</div>
+                <a href="{url}" class="source-link" target="_blank">阅读原文 →</a>
             </div>'''
 
-        sections_html += f'''
+def render_section(section_title: str, icon: str, icon_class: str,
+                   items: list, badge_class: str, card_class: str) -> str:
+    cards_html = ""
+    count = 0
+    for item in items:
+        card = render_card(item, badge_class, card_class)
+        if card:
+            cards_html += card
+            count += 1
+    if count == 0:
+        return ""
+    return f'''
         <div class="section">
             <div class="section-header">
-                <div class="section-icon">{section.get('icon','📰')}</div>
-                <div class="section-title">{section.get('title','')}</div>
-                <span class="section-count">{len(section.get('items',[]))} 条资讯</span>
+                <div class="section-icon {icon_class}">{icon}</div>
+                <div class="section-title">{section_title}</div>
+                <span class="section-count">{count} 条资讯</span>
             </div>
-            <div class="news-grid">{items_html}</div>
+            <div class="news-grid">{cards_html}
+            </div>
         </div>'''
 
-    date_cn = datetime.datetime.strptime(TODAY, "%Y-%m-%d").strftime("%Y年%m月%d日")
+def generate_html(sections_data: list) -> str:
+    total = sum(len(s["results"]) for s in sections_data)
+    weekday = get_weekday()
+
+    sections_html = ""
+    for s in sections_data:
+        if not s["results"]:
+            continue
+        icon_class = "cn" if s["card"] == "cn" else "us"
+        icon = "🇨🇳" if s["card"] == "cn" else ("🔍" if "Gemini" in s["section"] else "🇺🇸")
+        sections_html += render_section(
+            s["section"], icon, icon_class,
+            s["results"], s["badge"], s["card"]
+        )
+
     return f'''<div class="container">
     <div class="header">
         <div class="header-content">
             <div class="header-badge">🌐 GLOBAL AI INTELLIGENCE REPORT</div>
             <h1>🤖 全球AI行业资讯日报</h1>
             <div class="subtitle">聚焦 OpenAI · Anthropic · Google Gemini · xAI Grok · 国内大模型</div>
-            <div class="date">{date_cn} · 精选今日最重磅动态</div>
+            <div class="date">{DATE_CN} {weekday} · 精选今日最重磅动态</div>
         </div>
     </div>
     <div class="stats-bar">
@@ -156,88 +148,45 @@ def render_html(data: dict) -> str:
         <div class="stat-item"><span class="stat-number">5</span><span class="stat-label">重点企业</span></div>
         <div class="stat-item"><span class="stat-number">24h</span><span class="stat-label">时效范围</span></div>
     </div>
-    <div class="content">{sections_html}</div>
+    <div class="content">{sections_html}
+    </div>
     <div class="footer">
-        <p>🤖 由 <strong>WorkBuddy</strong> 智能整理生成 · 数据来源于新浪财经、东方财富、IT之家、腾讯新闻等权威媒体</p>
-        <p>本报告仅供参考，不构成任何投资建议 · 信息截止时间：{date_cn}</p>
+        <p>🤖 由 <strong>WorkBuddy</strong> 智能整理生成 · 数据来源于 Tavily 实时搜索</p>
+        <p>本报告仅供参考，不构成任何投资建议 · 信息截止时间：{DATE_CN}</p>
     </div>
 </div>'''
 
-# ── 无 API Key 时的降级处理 ──
-def generate_html_fallback(raw_results: list[dict]) -> str:
-    date_cn = datetime.datetime.strptime(TODAY, "%Y-%m-%d").strftime("%Y年%m月%d日")
-    items_html = ""
-    for r in raw_results[:10]:
-        items_html += f'''
-        <div class="news-card">
-            <div class="news-card-top">
-                <span class="company-badge badge-industry">AI资讯</span>
-                <span class="news-time">今日</span>
-            </div>
-            <h2>{r.get('title','')}</h2>
-            <div class="summary">{r.get('content','')[:200]}...</div>
-            <a href="{r.get('url','#')}" class="source-link" target="_blank">阅读原文 →</a>
-        </div>'''
-
-    return f'''<div class="container">
-    <div class="header">
-        <div class="header-content">
-            <div class="header-badge">🌐 GLOBAL AI INTELLIGENCE REPORT</div>
-            <h1>🤖 全球AI行业资讯日报</h1>
-            <div class="date">{date_cn}</div>
-        </div>
-    </div>
-    <div class="content">
-        <div class="section">
-            <div class="section-header">
-                <div class="section-icon">📰</div>
-                <div class="section-title">今日 AI 资讯</div>
-            </div>
-            <div class="news-grid">{items_html}</div>
-        </div>
-    </div>
-</div>'''
-
-# ── 更新 index.json ──
 def update_index():
+    data = {"latest": "", "dates": []}
     if INDEX_FILE.exists():
         with open(INDEX_FILE) as f:
             data = json.load(f)
-    else:
-        data = {"latest": "", "dates": []}
-
     if TODAY not in data["dates"]:
         data["dates"].insert(0, TODAY)
     data["latest"] = data["dates"][0]
-
     with open(INDEX_FILE, "w") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-    print(f"✅ 更新 index.json，当前共 {len(data['dates'])} 天")
+    print(f"  ✅ 更新 index.json，共 {len(data['dates'])} 天")
 
-# ── 主流程 ──
 def main():
     print(f"📅 开始生成 {TODAY} 日报...")
     NEWS_DIR.mkdir(exist_ok=True)
 
-    # 搜索资讯
-    all_results = []
+    sections_data = []
     for q in SEARCH_QUERIES:
-        print(f"  🔍 搜索：{q}")
-        all_results.extend(search_news(q))
-    print(f"  📥 共获取 {len(all_results)} 条原始资讯")
+        print(f"  🔍 搜索：{q['q']}")
+        results = search(q["q"])
+        print(f"     获取 {len(results)} 条")
+        sections_data.append({**q, "results": results})
 
-    # 生成 HTML
-    html = generate_html_with_llm(all_results)
-
-    # 写入文件
-    out_file = NEWS_DIR / f"{TODAY}.html"
-    with open(out_file, "w", encoding="utf-8") as f:
+    html = generate_html(sections_data)
+    out = NEWS_DIR / f"{TODAY}.html"
+    with open(out, "w", encoding="utf-8") as f:
         f.write(html)
-    print(f"  ✅ 已写入 {out_file}")
+    print(f"  ✅ 已写入 {out}（{len(html)} 字节）")
 
-    # 更新索引
     update_index()
-    print("🎉 日报生成完成！")
+    print("🎉 完成！")
 
 if __name__ == "__main__":
     main()
