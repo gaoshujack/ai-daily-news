@@ -37,5 +37,10 @@ jobs:
           git diff --cached --quiet || git commit -m "📰 自动生成 $(date +%Y-%m-%d) AI资讯日报"
           git push
 
+      - name: 配置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
       - name: 部署到腾讯云 EdgeOne Pages
         run: npx edgeone pages deploy . -n ai-daily-news -t ${{ secrets.EDGEONE_API_TOKEN }}
