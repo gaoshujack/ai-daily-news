@@ -1,9 +1,9 @@
 name: 每日AI资讯日报自动生成
 
 on:
-  schedule:
-    - cron: '0 2 * * *'  # 每天 UTC 02:00（北京时间 10:00）
-  workflow_dispatch:      # 支持手动触发
+  # schedule:
+  #   - cron: '0 2 * * *'  # 已暂停自动运行，改为手动高质量生成
+  workflow_dispatch:      # 仅支持手动触发
 
 permissions:
   contents: write
